@@ -14,6 +14,9 @@ import hashlib
 import functools
 from datetime import datetime
 
+from dotenv import load_dotenv
+load_dotenv()  # reads GROQ_API_KEY from a .env file in the same folder, if present
+
 import streamlit as st
 from groq import Groq
 
@@ -209,18 +212,39 @@ def researcher_agent(client, question, memory_context=""):
         {"role": "system", "content": f"You are a Researcher agent. Use tools when useful. Relevant memory: {memory_context}"},
         {"role": "user", "content": question},
     ]
-    resp = client.chat.completions.create(model=SMART_MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto")
+    try:
+        resp = client.chat.completions.create(model=SMART_MODEL, messages=messages, tools=TOOL_SCHEMAS, tool_choice="auto")
+    except Exception:
+        # Groq sometimes fails to format a tool call correctly (tool_use_failed).
+        # Fall back to a plain answer without tools instead of surfacing the raw error.
+        plain = client.chat.completions.create(
+            model=SMART_MODEL,
+            messages=[{"role": "system", "content": "Answer directly and concisely, no tools available."},
+                      {"role": "user", "content": question}],
+        )
+        log_trace("researcher_fallback_no_tools", plain)
+        return plain.choices[0].message.content, False
+
     log_trace("researcher", resp)
     msg = resp.choices[0].message
     if msg.tool_calls:
-        for call in msg.tool_calls:
-            args = json.loads(call.function.arguments)
-            result = TOOL_REGISTRY[call.function.name](**args)
-            messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
-            messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
-        follow_up = client.chat.completions.create(model=SMART_MODEL, messages=messages)
-        log_trace("researcher_followup", follow_up)
-        return follow_up.choices[0].message.content, True
+        try:
+            for call in msg.tool_calls:
+                args = json.loads(call.function.arguments)
+                result = TOOL_REGISTRY[call.function.name](**args)
+                messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
+            follow_up = client.chat.completions.create(model=SMART_MODEL, messages=messages)
+            log_trace("researcher_followup", follow_up)
+            return follow_up.choices[0].message.content, True
+        except Exception:
+            plain = client.chat.completions.create(
+                model=SMART_MODEL,
+                messages=[{"role": "system", "content": "Answer directly and concisely, no tools available."},
+                          {"role": "user", "content": question}],
+            )
+            log_trace("researcher_fallback_after_tool_error", plain)
+            return plain.choices[0].message.content, False
     return msg.content, False
 
 def critic_agent(client, findings):
@@ -253,9 +277,22 @@ def writer_agent(client, topic, findings, critique):
 # =============================================================================
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_key = st.text_input("Groq API Key", value=os.environ.get("GROQ_API_KEY", ""), type="password",
-                             help="Get a free key at console.groq.com")
-    st.caption("Or set the GROQ_API_KEY environment variable before launching.")
+
+    env_api_key = os.environ.get("GROQ_API_KEY", "")
+
+    if env_api_key and "manual_key_override" not in st.session_state:
+        st.success("✅ Groq API key loaded from .env")
+        api_key = env_api_key
+        if st.toggle("Use a different key instead"):
+            st.session_state.manual_key_override = True
+            st.rerun()
+    else:
+        api_key = st.text_input("Groq API Key", value=env_api_key, type="password",
+                                 help="Get a free key at console.groq.com")
+        st.caption("Loaded from your .env file — edit it here only if you need to override it.")
+        if env_api_key and st.button("↩️ Use .env key again"):
+            st.session_state.pop("manual_key_override", None)
+            st.rerun()
 
     st.divider()
     st.header("🧠 Memory")
