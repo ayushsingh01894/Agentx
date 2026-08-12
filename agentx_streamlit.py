@@ -438,3 +438,6 @@ if st.session_state.last_report:
         mime="text/markdown",
     )
     st.markdown("</div>", unsafe_allow_html=True)
+
+
+
